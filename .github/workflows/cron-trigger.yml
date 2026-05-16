@@ -20,7 +20,7 @@ jobs:
             || echo -e "\n000")
           
           HttpResponseCode=$(echo "$RESPONSE" | tail -n1)
-         ResponseBody=$(echo "$RESPONSE" | sed '$d')
+          ResponseBody=$(echo "$RESPONSE" | sed '$d')
           
           echo "HTTP Status: $HttpResponseCode"
           echo "Response: $ResponseBody"
