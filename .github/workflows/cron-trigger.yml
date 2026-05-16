@@ -2,16 +2,34 @@ name: Trigger Collection - Manual & Schedule
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # 每 5 分钟自动运行
+    - cron: '*/5 * * * *'  # 每 5 分钟自动运行（UTC 时间）
   workflow_dispatch:        # 允许手动触发
 
 jobs:
   trigger:
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger Collection
+      - name: Trigger Collection (POST request)
         run: |
-          echo "Triggering ys-admin Worker at $(date)"
-          curl -X POST https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
-            -H "User-Agent: GitHub-Actions" \
-            || echo "Trigger failed, will retry on next schedule"
+          echo "Triggering ys-admin Worker at $(date -u)"
+          
+          # 使用 curl 发送 POST 请求
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
+            -H "User-Agent: GitHub-Actions-Cron" \
+            || echo -e "\n000")
+          
+          HttpResponseCode=$(echo "$RESPONSE" | tail -n1)
+         ResponseBody=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "HTTP Status: $HttpResponseCode"
+          echo "Response: $ResponseBody"
+          
+          # 检查响应是否成功
+          if [ "$HttpResponseCode" = "200" ] && echo "$ResponseBody" | grep -q "\"code\":1"; then
+            echo "✅ Trigger succeeded"
+            exit 0
+          else
+            echo "❌ Trigger failed or returned error"
+            exit 1
+          fi
