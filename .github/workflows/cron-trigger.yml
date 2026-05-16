@@ -1,15 +1,6 @@
-name: Trigger Collection
+name: Trigger Collection - Manual & Schedule
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # 每 5 分钟
-
-jobs:
-  trigger:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger Collection
-        run: |
-          echo "Triggering ys-admin Worker at $(date)"
-          curl -X POST https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
-            || echo "Trigger failed, will retry next schedule"
+    - cron: '*/5 * * * *'  # 每 5 分钟自动运行
+  workflow_dispatch:        # 允许手动触发
