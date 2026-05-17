@@ -9,10 +9,11 @@ jobs:
   trigger:
     runs-on: ubuntu-latest
     steps:
-      - name: Check Cron Health & Trigger if Needed
+      - name: Check Cron Health & Auto-Recovery
         run: |
           echo "=== Backup Cron Check at $(date -u) ==="
           
+          # Step 0: 健康检查
           HEALTH_RESPONSE=$(curl -s -w "\n%{http_code}" \
             https://ys-admin.ftsqm.xyz/api/diagnose/cron \
             -H "User-Agent: GitHub-Actions-Cron" \
@@ -21,129 +22,118 @@ jobs:
           HealthHttpCode=$(echo "$HEALTH_RESPONSE" | tail -n1)
           HealthBody=$(echo "$HEALTH_RESPONSE" | sed '$d')
           
-          echo "Health Check HTTP: $HealthHttpCode"
+          echo "Health HTTP: $HealthHttpCode"
           echo "Health Response: $HealthBody"
           
+          # 初始化状态变量
+          NEED_REDEPLOY=false
+          NEED_TRIGGER=false
+          
           if [ "$HealthHttpCode" != "200" ]; then
-            echo "❌ Health check failed, attempting full recovery"
-            RESET_NEEDED=true
-            ROLLBACK_NEEDED=true
-            TRIGGER_AFTER_RESET=true
+            echo "❌ Health check failed (HTTP $HealthHttpCode)"
+            NEED_REDEPLOY=true
+            NEED_TRIGGER=true
           else
             CRON_HEALTHY=$(echo "$HealthBody" | grep -o '"cronHealthy":[^,}]*' | cut -d':' -f2)
             CRON_TRIGGERED=$(echo "$HealthBody" | grep -o '"cronTriggered":[^,}]*' | cut -d':' -f2)
             SINCE_COLLECT=$(echo "$HealthBody" | grep -o '"sinceLastCollectSeconds":[^,}]*' | cut -d':' -f2)
             HAS_LOCK=$(echo "$HealthBody" | grep -o '"hasLock":[^,}]*' | cut -d':' -f2)
             
-            echo "Cron Healthy (collection executed recently): $CRON_HEALTHY"
-            echo "Cron Triggered (cron fired recently): $CRON_TRIGGERED"
-            echo "Since Last Collection: ${SINCE_COLLECT}s"
-            echo "Has Lock: $HAS_LOCK"
+            echo "cronHealthy=$CRON_HEALTHY | cronTriggered=$CRON_TRIGGERED | sinceLastCollect=${SINCE_COLLECT}s | hasLock=$HAS_LOCK"
             
+            # 场景1：一切正常 → 跳过
             if [ "$CRON_HEALTHY" = "true" ]; then
-              echo "✅ Collection executed recently (${SINCE_COLLECT}s ago), skipping backup trigger"
+              echo "✅ Collection executed recently (${SINCE_COLLECT}s ago), skipping"
               exit 0
             fi
             
+            # 场景2：任务正在运行 → 跳过
             if [ "$HAS_LOCK" = "true" ]; then
-              echo "⏳ Collection task is running, skipping backup trigger"
+              echo "⏳ Collection running, skipping"
               exit 0
             fi
             
-            RESET_NEEDED=true
-            ROLLBACK_NEEDED=false
-            TRIGGER_AFTER_RESET=true
+            # 场景3：需要恢复
+            NEED_TRIGGER=true
             
-            if [ "$CRON_TRIGGERED" = "true" ] && [ "$CRON_HEALTHY" = "false" ]; then
-              echo "⚠️ Cron triggered but collection stuck, will reset + rollback + re-trigger"
-              ROLLBACK_NEEDED=true
-            elif [ "$CRON_TRIGGERED" = "false" ]; then
-              echo "⚠️ Cloudflare Cron appears stopped, will reset + rollback + re-trigger"
-              ROLLBACK_NEEDED=true
-              # 每小时强制一次 rollback（重置运行时状态）
-              if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt 3600 ] 2>/dev/null; then
-                echo "📌 Last collection was ${SINCE_COLLECT}s ago (>1h), forcing runtime reset"
-                FORCE_ROLLBACK=true
-              fi
+            # 判断是否需要完整重置（redeploy）
+            if [ "$CRON_TRIGGERED" = "false" ]; then
+              echo "⚠️ Cloudflare Cron stopped, full reset needed"
+              NEED_REDEPLOY=true
+            elif [ "$CRON_TRIGGERED" = "true" ] && [ "$CRON_HEALTHY" = "false" ]; then
+              echo "⚠️ Cron triggered but collection stuck, reset needed"
+              NEED_REDEPLOY=true
+            fi
+            
+            # 强制重置：超过 1 小时未采集
+            if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt 3600 ] 2>/dev/null; then
+              echo "📌 No collection for >1h (${SINCE_COLLECT}s), forcing full reset"
+              NEED_REDEPLOY=true
             fi
           fi
           
-          if [ "$RESET_NEEDED" = "true" ]; then
-            echo "--- Step 1: Resetting KV State ---"
-            RESET_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-              https://ys-admin.ftsqm.xyz/api/diagnose/reset-cron \
+          # Step 1: 完全重置运行时（KV + Settings）
+          if [ "$NEED_REDEPLOY" = "true" ]; then
+            echo ""
+            echo "=== Step 1: Full Runtime Reset (Redeploy) ==="
+            
+            REDEPLOY_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              https://ys-admin.ftsqm.xyz/api/diagnose/redeploy \
               -H "User-Agent: GitHub-Actions-Cron" \
+              -H "Content-Type: application/json" \
               || echo -e "\n000")
             
-            ResetHttpCode=$(echo "$RESET_RESPONSE" | tail -n1)
-            ResetBody=$(echo "$RESET_RESPONSE" | sed '$d')
+            RedeployHttpCode=$(echo "$REDEPLOY_RESPONSE" | tail -n1)
+            RedeployBody=$(echo "$REDEPLOY_RESPONSE" | sed '$d')
             
-            echo "Reset HTTP: $ResetHttpCode"
-            echo "Reset Response: $ResetBody"
+            echo "Redeploy HTTP: $RedeployHttpCode"
+            echo "Redeploy Response: $RedeployBody"
             
-            DELETED_COUNT=$(echo "$ResetBody" | grep -o '"deletedCount":[^,}]*' | cut -d':' -f2)
-            echo "✅ KV Reset completed: ${DELETED_COUNT:-unknown} keys deleted"
-          fi
-          
-          if [ "$ROLLBACK_NEEDED" = "true" ]; then
-            echo "--- Step 2: Rolling Back Worker Runtime ---"
+            KV_RESET=$(echo "$RedeployBody" | grep -o '"kvReset":[^,}]*' | cut -d':' -f2)
+            REDEPLOY_OK=$(echo "$RedeployBody" | grep -o '"redeployTriggered":[^,}]*' | cut -d':' -f2)
+            DELETED_KEYS=$(echo "$RedeployBody" | grep -o '"deletedKeys":[^,}]*' | cut -d':' -f2)
             
-            VERSION_RESPONSE=$(curl -s https://ys-admin.ftsqm.xyz/api/diagnose/version \
-              -H "User-Agent: GitHub-Actions-Cron" \
-              || echo '{"versionId":"unknown"}')
+            echo "KV Reset: ${KV_RESET:-unknown}"
+            echo "Settings Update: ${REDEPLOY_OK:-unknown}"
+            echo "Keys Deleted: ${DELETED_KEYS:-unknown}"
             
-            CURRENT_VERSION=$(echo "$VERSION_RESPONSE" | grep -o '"versionId":"[^"]*"' | cut -d'"' -f4)
-            echo "Current Worker Version: $CURRENT_VERSION"
-            
-            if [ "$CURRENT_VERSION" != "unknown" ] && [ -n "${CLOUDFIRE_API_TOKEN}" ]; then
-              echo "Executing wrangler rollback to version $CURRENT_VERSION..."
-              
-              npx wrangler rollback "$CURRENT_VERSION" 2>&1 || {
-                echo "⚠️ wrangler rollback failed, trying alternative deploy..."
-                cd /tmp && git clone --depth 1 https://github.com/hackv/YS.git worker-repo 2>/dev/null || true
-                if [ -d "/tmp/worker-repo/ys-admin/cf-worker" ]; then
-                  cd /tmp/worker-repo/ys-admin/cf-worker
-                  npm install wrangler 2>/dev/null
-                  npx wrangler deploy 2>&1 || echo "⚠️ deploy also failed"
-                else
-                  echo "❌ Cannot perform runtime reset via wrangler"
-                fi
-              }
-              
-              echo "✅ Rollback/Deploy completed - Worker runtime has been reset"
-              sleep 5
+            if [ "$KV_RESET" != "true" ]; then
+              echo "⚠️ KV reset may have failed, checking..."
             else
-              echo "⚠️ Skipping rollback (no API token or version unknown)"
-              echo "   KV state has been cleared, which should resolve most issues"
+              echo "✅ Runtime state cleared (${DELETED_KEYS:-?} keys)"
             fi
+            
+            sleep 3
           fi
           
-          if [ "$TRIGGER_AFTER_RESET" = "true" ]; then
-            echo "--- Step 3: Triggering Collection ---"
-            sleep 3
+          # Step 2: 触发采集任务
+          if [ "$NEED_TRIGGER" = "true" ]; then
+            echo ""
+            echo "=== Step 2: Trigger Collection ==="
             
-            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            TRIGGER_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
               https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
               -H "User-Agent: GitHub-Actions-Cron" \
               || echo -e "\n000")
             
-            HttpResponseCode=$(echo "$RESPONSE" | tail -n1)
-            ResponseBody=$(echo "$RESPONSE" | sed '$d')
+            TriggerHttpCode=$(echo "$TRIGGER_RESPONSE" | tail -n1)
+            TriggerBody=$(echo "$TRIGGER_RESPONSE" | sed '$d')
             
-            echo "Trigger HTTP: $HttpResponseCode"
-            echo "Trigger Response: $ResponseBody"
+            echo "Trigger HTTP: $TriggerHttpCode"
+            echo "Trigger Response: $TriggerBody"
             
-            SKIPPED=$(echo "$ResponseBody" | grep -o '"skipped":[^,}]*' | cut -d':' -f2)
+            SKIPPED=$(echo "$TriggerBody" | grep -o '"skipped":[^,}]*' | cut -d':' -f2)
+            
             if [ "$SKIPPED" = "true" ]; then
-              echo "✅ Worker decided to skip (collection recovered or task running)"
+              echo "✅ Worker skipped (task recovered or running)"
               exit 0
             fi
             
-            if [ "$HttpResponseCode" = "200" ]; then
-              echo "✅ Full recovery cycle completed (reset → rollback → trigger)"
+            if [ "$TriggerHttpCode" = "200" ]; then
+              echo "✅ Recovery cycle completed successfully"
               exit 0
             else
-              echo "❌ Trigger failed after recovery"
+              echo "❌ Trigger failed after recovery (HTTP $TriggerHttpCode)"
               exit 1
             fi
           fi
