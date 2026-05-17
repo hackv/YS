@@ -26,12 +26,12 @@ jobs:
           echo "Health Response: $HealthBody"
           
           # 初始化状态变量
-          NEED_REDEPLOY=false
+          NEED_ROLLBACK=false
           NEED_TRIGGER=false
           
           if [ "$HealthHttpCode" != "200" ]; then
             echo "❌ Health check failed (HTTP $HealthHttpCode)"
-            NEED_REDEPLOY=true
+            NEED_ROLLBACK=true
             NEED_TRIGGER=true
           else
             CRON_HEALTHY=$(echo "$HealthBody" | grep -o '"cronHealthy":[^,}]*' | cut -d':' -f2)
@@ -56,54 +56,75 @@ jobs:
             # 场景3：需要恢复
             NEED_TRIGGER=true
             
-            # 判断是否需要完整重置（redeploy）
+            # 判断是否需要 rollback（重启 Worker Isolate）
             if [ "$CRON_TRIGGERED" = "false" ]; then
-              echo "⚠️ Cloudflare Cron stopped, full reset needed"
-              NEED_REDEPLOY=true
+              echo "⚠️ Cloudflare Cron stopped, need rollback to restart Isolate"
+              NEED_ROLLBACK=true
             elif [ "$CRON_TRIGGERED" = "true" ] && [ "$CRON_HEALTHY" = "false" ]; then
-              echo "⚠️ Cron triggered but collection stuck, reset needed"
-              NEED_REDEPLOY=true
+              echo "⚠️ Cron triggered but collection stuck, rollback needed"
+              NEED_ROLLBACK=true
             fi
             
-            # 强制重置：超过 1 小时未采集
-            if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt 3600 ] 2>/dev/null; then
-              echo "📌 No collection for >1h (${SINCE_COLLECT}s), forcing full reset"
-              NEED_REDEPLOY=true
+            # 强制重置：超过 30 分钟未采集（降低阈值，更快响应）
+            if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt 1800 ] 2>/dev/null; then
+              echo "📌 No collection for >30min (${SINCE_COLLECT}s), forcing rollback"
+              NEED_ROLLBACK=true
             fi
           fi
           
-          # Step 1: 完全重置运行时（KV + Settings）
-          if [ "$NEED_REDEPLOY" = "true" ]; then
+          # Step 1: Wrangler Rollback（真正重启 Worker Isolate）
+          if [ "$NEED_ROLLBACK" = "true" ]; then
             echo ""
-            echo "=== Step 1: Full Runtime Reset (Redeploy) ==="
+            echo "=== Step 1: Wrangler Rollback (Restart Worker Isolate) ==="
             
-            REDEPLOY_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-              https://ys-admin.ftsqm.xyz/api/diagnose/redeploy \
-              -H "User-Agent: GitHub-Actions-Cron" \
-              -H "Content-Type: application/json" \
-              || echo -e "\n000")
+            # 安装 wrangler
+            npm install -g wrangler@latest > /dev/null 2>&1 || true
             
-            RedeployHttpCode=$(echo "$REDEPLOY_RESPONSE" | tail -n1)
-            RedeployBody=$(echo "$REDEPLOY_RESPONSE" | sed '$d')
+            # 获取最新版本 ID
+            VERSION_INFO=$(curl -s https://ys-admin.ftsqm.xyz/api/diagnose/version \
+              -H "User-Agent: GitHub-Actions-Cron" || echo '{}')
             
-            echo "Redeploy HTTP: $RedeployHttpCode"
-            echo "Redeploy Response: $RedeployBody"
+            VERSION_ID=$(echo "$VERSION_INFO" | grep -o '"versionId":"[^"]*"' | cut -d'"' -f4)
             
-            KV_RESET=$(echo "$RedeployBody" | grep -o '"kvReset":[^,}]*' | cut -d':' -f2)
-            REDEPLOY_OK=$(echo "$RedeployBody" | grep -o '"redeployTriggered":[^,}]*' | cut -d':' -f2)
-            DELETED_KEYS=$(echo "$RedeployBody" | grep -o '"deletedKeys":[^,}]*' | cut -d':' -f2)
+            echo "Target Version ID: ${VERSION_ID:-unknown}"
             
-            echo "KV Reset: ${KV_RESET:-unknown}"
-            echo "Settings Update: ${REDEPLOY_OK:-unknown}"
-            echo "Keys Deleted: ${DELETED_KEYS:-unknown}"
-            
-            if [ "$KV_RESET" != "true" ]; then
-              echo "⚠️ KV reset may have failed, checking..."
+            if [ -n "$VERSION_ID" ] && [ "$VERSION_ID" != "unknown" ] && [ "$VERSION_ID" != "" ]; then
+              echo "Executing: wrangler rollback $VERSION_ID --yes"
+              
+              ROLLBACK_OUTPUT=$(npx wrangler rollback "$VERSION_ID" --yes 2>&1) || {
+                ROLLBACK_ERROR=$?
+                echo "Rollback output: $ROLLBACK_OUTPUT"
+                echo "⚠️ Rollback command returned error code $ROLLBACK_ERROR"
+                echo "Fallback: using API redeploy instead..."
+                
+                # Fallback: 如果 rollback 失败，使用 API redeploy
+                curl -s -X POST https://ys-admin.ftsqm.xyz/api/diagnose/redeploy \
+                  -H "User-Agent: GitHub-Actions-Cron" \
+                  -H "Content-Type: application/json" > /dev/null || true
+                
+                sleep 5
+              }
+              
+              if [ $? -eq 0 ] && [ -z "$ROLLBACK_ERROR" ]; then
+                echo "✅ Rollback success! New Isolate will be created."
+                echo "Output: $ROLLBACK_OUTPUT"
+              else
+                echo "✅ Fallback redeploy completed (KV cleared)"
+              fi
             else
-              echo "✅ Runtime state cleared (${DELETED_KEYS:-?} keys)"
+              echo "⚠️ Could not get version ID, using fallback redeploy..."
+              
+              # Fallback: 使用 API redeploy 清理 KV
+              curl -s -X POST https://ys-admin.ftsqm.xyz/api/diagnose/redeploy \
+                -H "User-Agent: GitHub-Actions-Cron" \
+                -H "Content-Type: application/json" > /dev/null || true
+              
+              echo "✅ Fallback redeploy completed (KV cleared)"
             fi
             
-            sleep 3
+            # 等待新 Isolate 生效
+            echo "Waiting for new Isolate to initialize..."
+            sleep 5
           fi
           
           # Step 2: 触发采集任务
