@@ -523,7 +523,7 @@ async function collectWithApi(
   startTime: Date,
   startCategoryIndex: number = 0,
   categoriesToProcess: number = -1,
-  minDetailPerCategory: number = 20,
+  minDetailPerCategory: number = 30,
   categoryId: string | null = null,
   abortCheck?: () => Promise<void>
 ) {
@@ -541,8 +541,8 @@ async function collectWithApi(
   const AVAILABLE_REQUESTS = MAX_SUBREQUESTS - RESERVE_REQUESTS;
   
   // 数据完整性硬性要求（必须满足）
-  const MIN_DETAIL_PER_CATEGORY = 20; // 每个分类最少采集 20 个详情（硬性要求，不可妥协）
-  const MIN_PAGES_PER_CATEGORY = 1; // 优化：每分类最少 1 页列表（减少列表开销）
+  const MIN_DETAIL_PER_CATEGORY = 30; // 每个分类最少采集 30 个详情（硬性要求，不可妥协）
+  const MIN_PAGES_PER_CATEGORY = 2; // 优化：每分类最少 2 页列表（减少列表开销）
   
   // 可配置参数（从前端获取）
   const REQUESTED_PAGES = pageLimit || MIN_PAGES_PER_CATEGORY;
@@ -713,7 +713,7 @@ async function collectWithApi(
     }
   } else {
     if (sourceCategories.length > 0) {
-      const subCategoryMap = new Map<string, { sourceTypeId: string, sourceTypeName: string, parentTypeId: string }[]>();
+      const subCategoryMap = new Map<string, number>();
       
       for (const sourceCat of sourceCategories) {
         const sourceTypeId = String(sourceCat.type_id);
@@ -755,23 +755,26 @@ async function collectWithApi(
           
           if (subCatResp.ok) {
             const subCatData = await subCatResp.json();
+            
             if (subCatData.class && Array.isArray(subCatData.class)) {
               const childCategories = subCatData.class
                 .filter((c: any) => Number(c.type_pid) === Number(sourceTypeId));
               
               if (childCategories.length > 0) {
                 const parentTargetId = typeMapping.get(sourceTypeId) || fallbackCategory.id;
-                const subCats: { sourceTypeId: string, sourceTypeName: string, parentTypeId: string }[] = [];
                 
                 for (const child of childCategories) {
                   const childTypeId = String(child.type_id);
                   typeMapping.set(childTypeId, parentTargetId);
-                  subCats.push({ sourceTypeId: childTypeId, sourceTypeName: child.type_name, parentTypeId: sourceTypeId });
                 }
                 
-                subCategoryMap.set(sourceTypeId, subCats);
+                subCategoryMap.set(sourceTypeId, childCategories.length);
                 console.log(`[collectWithApi] 📂 ${sourceCat.type_name}(${sourceTypeId}): expanded ${childCategories.length} subcategories`);
+              } else {
+                console.log(`[collectWithApi] 📄 ${sourceCat.type_name}(${sourceTypeId}): no subcategories, will collect directly`);
               }
+            } else {
+              console.log(`[collectWithApi] 📄 ${sourceCat.type_name}(${sourceTypeId}): no class field, will collect directly`);
             }
           }
         } catch (e) {
@@ -1044,8 +1047,12 @@ async function collectWithApi(
       incrementSubRequests(1);
       
       try {
-        const detailUrl = `${apiHost}?ac=videolist&ids=${item.vod_id}`;
-        console.log(`[collectWithApi] Fetch detail (${detailRequestCount}): ${detailUrl}`);
+        let detailData = null;
+        let detailSource = '';
+        
+        for (const acType of ['videolist', 'detail']) {
+          const detailUrl = `${apiHost}?ac=${acType}&ids=${item.vod_id}`;
+          console.log(`[collectWithApi] Fetch detail (${detailRequestCount}, ac=${acType}): ${detailUrl}`);
           
           const detailResp = await fetch(detailUrl, {
             method: 'GET',
@@ -1056,103 +1063,88 @@ async function collectWithApi(
             signal: AbortSignal.timeout(15000)
           });
           
-          if (detailResp.ok) {
-            const detailJson = await detailResp.json();
-            console.log(`[collectWithApi] ========== DETAIL API RESPONSE ==========`);
-            console.log(`[collectWithApi] Detail response status: ${detailResp.status}`);
-            console.log(`[collectWithApi] Detail response keys: ${Object.keys(detailJson).join(', ')}`);
-            console.log(`[collectWithApi] Detail response:`, JSON.stringify(detailJson).substring(0, 500));
-            
-            // 尝试多种可能的数据结构
-            let detailData = null;
-            let detailSource = ''; // 记录数据来源
-            if (detailJson.list && Array.isArray(detailJson.list) && detailJson.list.length > 0) {
-              detailData = detailJson.list[0];
-              detailSource = 'list';
-              console.log(`[collectWithApi] ✓ Found data in 'list' field`);
-            } else if (detailJson.data && Array.isArray(detailJson.data) && detailJson.data.length > 0) {
-              detailData = detailJson.data[0];
-              detailSource = 'data[]';
-              console.log(`[collectWithApi] ✓ Found data in 'data' field`);
-            } else if (detailJson.tsid && Array.isArray(detailJson.tsid) && detailJson.tsid.length > 0) {
-              detailData = detailJson.tsid[0];
-              detailSource = 'tsid';
-              console.log(`[collectWithApi] ✓ Found data in 'tsid' field`);
-            } else if (detailJson.code === 1 && detailJson.data) {
-              if (Array.isArray(detailJson.data)) {
-                detailData = detailJson.data[0];
-              } else {
-                detailData = detailJson.data;
-              }
-              detailSource = 'data object';
-              console.log(`[collectWithApi] ✓ Found data in 'data' object`);
-            }
-            
-            if (detailData) {
-              console.log(`[collectWithApi] ✓ Detail data found for ${item.vod_id} (source: ${detailSource})`);
-              console.log(`[collectWithApi] Detail data keys:`, Object.keys(detailData));
-              
-              // 详细的字段检查
-              const possiblePicFields = ['vod_pic', 'pic', 'img', 'image', 'cover', 'vod_pic_small', 'pic_thumb'];
-              const possiblePlayUrlFields = ['vod_play_url', 'play_url', 'urls', 'playurl', 'playUrl'];
-              
-              for (const field of possiblePicFields) {
-                console.log(`[collectWithApi] Checking ${field}: ${detailData[field] !== undefined ? 'found' : 'not found'}, value: ${detailData[field] ? String(detailData[field]).substring(0, 100) : 'undefined/null'}`);
-              }
-              
-              for (const field of possiblePlayUrlFields) {
-                console.log(`[collectWithApi] Checking ${field}: ${detailData[field] !== undefined ? 'found' : 'not found'}, value: ${detailData[field] ? String(detailData[field]).substring(0, 200) : 'undefined/null'}`);
-              }
-              
-              // 尝试从多个字段中提取 vod_pic 和 vod_play_url
-              if (!detailData.vod_pic) {
-                for (const field of possiblePicFields) {
-                  if (detailData[field]) {
-                    detailData.vod_pic = detailData[field];
-                    console.log(`[collectWithApi] ✓ Fallback: set vod_pic from ${field}`);
-                    break;
-                  }
-                }
-              }
-              
-              if (!detailData.vod_play_url) {
-                for (const field of possiblePlayUrlFields) {
-                  if (detailData[field]) {
-                    detailData.vod_play_url = detailData[field];
-                    console.log(`[collectWithApi] ✓ Fallback: set vod_play_url from ${field}`);
-                    break;
-                  }
-                }
-              }
-              
-              console.log(`[collectWithApi] After fallback - Has vod_pic: ${!!detailData.vod_pic}, Has vod_play_url: ${!!detailData.vod_play_url}`);
-              
-              // 基本验证：必须有海报和播放链接（详细过滤在下方进行）
-              if (!detailData.vod_pic || !detailData.vod_play_url) {
-                console.log(`[collectWithApi] ⚠️ Skipping ${item.vod_id}: missing required fields (vod_pic=${!!detailData.vod_pic}, vod_play_url=${!!detailData.vod_play_url})`);
-                // 打印完整数据以便调试
-                console.log(`[collectWithApi] Full detailData:`, JSON.stringify(detailData).substring(0, 1000));
-                failed++;
-                continue;
-              }
-              
-              processedItems.push({ ...detailData, targetTypeId: item.targetTypeId, vod_id: item.vod_id });
-            } else {
-              console.log(`[collectWithApi] ⚠️ No detail data found for ${item.vod_id}, skipping (no fallback)`);
-              failed++;
-            }
-          } else {
-            const text = await detailResp.text();
-            console.log(`[collectWithApi] Detail request failed (${detailResp.status}) for ${item.vod_id}: ${text.substring(0, 200)}`);
+          if (!detailResp.ok) {
+            if (acType === 'videolist') continue;
+            console.error(`[collectWithApi] Detail failed (${detailResp.status}) for ${item.vod_id}`);
             failed++;
+            detailData = null;
+            break;
           }
-        } catch (e) {
-          console.error(`[collectWithApi] Detail error for ${item.vod_id}:`, e);
-          failed++;
+          
+          const detailJson = await detailResp.json();
+          
+          if (detailJson.list && Array.isArray(detailJson.list) && detailJson.list.length > 0) {
+            detailData = detailJson.list[0];
+            detailSource = `${acType}.list`;
+          } else if (detailJson.data && Array.isArray(detailJson.data) && detailJson.data.length > 0) {
+            detailData = detailJson.data[0];
+            detailSource = `${acType}.data[]`;
+          } else if (detailJson.tsid && Array.isArray(detailJson.tsid) && detailJson.tsid.length > 0) {
+            detailData = detailJson.tsid[0];
+            detailSource = `${acType}.tsid`;
+          } else if (detailJson.code === 1 && detailJson.data) {
+            detailData = Array.isArray(detailJson.data) ? detailJson.data[0] : detailJson.data;
+            detailSource = `${acType}.data object`;
+          }
+          
+          if (detailData && detailData.vod_play_url) {
+            console.log(`[collectWithApi] ✓ Got detail from ac=${acType} (source: ${detailSource})`);
+            break;
+          }
+          
+          if (acType === 'videolist' && detailData) {
+            console.log(`[collectWithApi] videolist returned data but no vod_play_url, trying detail...`);
+            continue;
+          }
+          
+          if (!detailData) {
+            console.log(`[collectWithApi] ⚠️ No detail data from ac=${acType} for ${item.vod_id}`);
+            if (acType === 'videolist') continue;
+          }
+          
+          break;
         }
+        
+        if (!detailData) {
+          console.log(`[collectWithApi] ⚠️ No detail data found for ${item.vod_id} from any ac type`);
+          failed++;
+          continue;
+        }
+        
+        const possiblePicFields = ['vod_pic', 'pic', 'img', 'image', 'cover', 'vod_pic_small', 'pic_thumb'];
+        if (!detailData.vod_pic) {
+          for (const field of possiblePicFields) {
+            if (detailData[field]) {
+              detailData.vod_pic = detailData[field];
+              break;
+            }
+          }
+        }
+        
+        const possiblePlayUrlFields = ['vod_play_url', 'play_url', 'urls', 'playurl', 'playUrl'];
+        if (!detailData.vod_play_url) {
+          for (const field of possiblePlayUrlFields) {
+            if (detailData[field]) {
+              detailData.vod_play_url = detailData[field];
+              break;
+            }
+          }
+        }
+        
+        if (!detailData.vod_pic || !detailData.vod_play_url) {
+          console.log(`[collectWithApi] ⚠️ Skipping ${item.vod_id}: missing fields (pic=${!!detailData.vod_pic}, play_url=${!!detailData.vod_play_url})`);
+          failed++;
+          continue;
+        }
+        
+        processedItems.push({ ...detailData, targetTypeId: item.targetTypeId, vod_id: item.vod_id });
+        
+      } catch (e) {
+        console.error(`[collectWithApi] Detail error for ${item.vod_id}:`, e);
+        failed++;
       }
+    }
     
-    // 分类间延迟（已设为0秒，快速处理）
     if (CATEGORY_DELAY_MS > 0) {
       console.log(`[collectWithApi] Category ${sourceTypeId} completed, waiting ${CATEGORY_DELAY_MS}ms before next category...`);
       await delay(CATEGORY_DELAY_MS);

@@ -21,7 +21,7 @@ binding = "BACKUP_BUCKET"
 bucket_name = "ys-admin-backups"
 
 [triggers]
-crons = [ "*/5 * * * *" ]
+crons = [ "*/3 * * * *" ]
 
 [[unsafe.vars]]
 name = "subrequest_limit"

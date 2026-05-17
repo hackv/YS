@@ -67,8 +67,8 @@ app.get('/api/diagnose/cron', async (c) => {
       cronLastCollect: lastCollect ? new Date(parseInt(lastCollect)).toISOString() : null,
       sinceLastRunSeconds: sinceLastRun,
       sinceLastCollectSeconds: sinceLastCollect,
-      cronHealthy: sinceLastCollect >= 0 && sinceLastCollect < 480,
-      cronTriggered: sinceLastRun >= 0 && sinceLastRun < 480,
+      cronHealthy: sinceLastCollect >= 0 && sinceLastCollect < 180,
+      cronTriggered: sinceLastRun >= 0 && sinceLastRun < 180,
       currentTime: new Date().toISOString(),
       currentTimeBeijing: getBeijingTime(),
       hasLock: !!lockValue,
@@ -90,7 +90,7 @@ app.post('/api/diagnose/trigger-cron', async (c) => {
     const lastCollectMs = lastCollectStr ? parseInt(lastCollectStr) : 0;
     const sinceLastCollect = lastCollectMs > 0 ? (Date.now() - lastCollectMs) / 1000 : -1;
     
-    if (sinceLastCollect >= 0 && sinceLastCollect < 480) {
+    if (sinceLastCollect >= 0 && sinceLastCollect < 180) {
       return c.json(response.success({
         message: '采集任务近期已执行，跳过',
         sinceLastCollectSeconds: Math.round(sinceLastCollect),
@@ -195,7 +195,7 @@ export default {
     await env.CACHE.put('cron_last_run', String(Date.now()), { expirationTtl: 86400 });
     
     switch (event.cron) {
-      case '*/5 * * * *':
+      case '*/3 * * * *':
         console.log('[CRON] Starting batch collection...');
         await (async () => {
           const startTime = Date.now();
@@ -512,7 +512,7 @@ async function executeBatchCollection(db: ReturnType<typeof createDatabase>, cac
     if (abortCheck) await abortCheck();
     
     // 执行采集（最核心部分，即使后续操作失败，采集结果已存入数据库）
-    result = await collectWithApi(db, source, null, cache, 2, startTime, currentIndex, 1, 20, null, abortCheck);
+    result = await collectWithApi(db, source, null, cache, 2, startTime, currentIndex, 1, 30, null, abortCheck);
     
     // 更新 KV 索引（最高优先级：使用重试机制确保写入一定成功）
     let retryCount = 0;
