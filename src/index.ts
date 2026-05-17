@@ -202,6 +202,17 @@ export default {
           try {
             const taskLockKey = 'collect_batch_running';
             const abortKey = 'collect_batch_abort';
+            
+            const lastCollectStr = await env.CACHE.get('cron_last_collect');
+            const lastCollectMs = lastCollectStr ? parseInt(lastCollectStr) : 0;
+            const sinceLastCollect = lastCollectMs > 0 ? (Date.now() - lastCollectMs) / 1000 : -1;
+            
+            if (sinceLastCollect > 600) {
+              console.log(`[CRON] ⚠️ Self-heal: No collection for ${Math.round(sinceLastCollect)}s, cleaning up stale state`);
+              await env.CACHE.delete(taskLockKey);
+              await env.CACHE.delete(abortKey);
+            }
+            
             const lockValue = await env.CACHE.get(taskLockKey);
             
             if (lockValue) {
@@ -267,6 +278,8 @@ export default {
             
             await env.CACHE.delete('collect_batch_running');
             await env.CACHE.delete('collect_batch_abort');
+            
+            await env.CACHE.put('cron_last_collect', String(Date.now()), { expirationTtl: 86400 });
           }
         })();
         break;

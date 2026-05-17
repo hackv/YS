@@ -2,7 +2,7 @@ name: Trigger Collection - Backup Cron
 
 on:
   schedule:
-    - cron: '*/3 * * * *'
+    - cron: '* * * * *'
   workflow_dispatch:
 
 jobs:
