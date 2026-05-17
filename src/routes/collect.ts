@@ -1217,19 +1217,17 @@ async function collectWithApi(
             
             // 解析播放链接，提取 m3u8 格式
             const parsePlayUrls = (playUrlStr: string): { playUrl: string, playFrom: string } => {
-              if (!playUrlStr) return { playUrl: '', playFrom: 'default' };
+              if (!playUrlStr) return { playUrl: '', playFrom: source.code || 'default' };
               
               console.log(`[collectWithApi] Parsing playUrlStr:`, playUrlStr.substring(0, 200));
               
-              // 直接使用原始格式保存所有播放链接
-              // 格式：第 1 集$链接#第 2 集$链接
               const cleanedPlayUrl = String(playUrlStr).trim();
               
               console.log(`[collectWithApi] Parsed ${cleanedPlayUrl.split('#').length} episodes, keeping all links`);
               
               return {
                 playUrl: cleanedPlayUrl,
-                playFrom: vodData.vod_play_from || 'default'
+                playFrom: vodData.vod_play_from || source.code || 'default'
               };
             };
             
@@ -1306,7 +1304,7 @@ async function collectWithApi(
             
             // 获取完整的原始播放链接用于保存
             const rawPlayUrl = vodData.vod_play_url || item.vod_play_url || '';
-            const rawPlayFrom = vodData.vod_play_from || item.vod_play_from || 'default';
+            const rawPlayFrom = vodData.vod_play_from || item.vod_play_from || source.code || 'default';
             // 使用解析后的播放信息，优先保存有效的 m3u8 链接
             const { playUrl: parsedPlayUrl, playFrom: parsedPlayFrom } = parsePlayUrls(vodPlayUrlRaw);
             
