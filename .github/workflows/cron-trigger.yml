@@ -29,15 +29,17 @@ jobs:
             TRIGGER_NEEDED=true
           else
             CRON_HEALTHY=$(echo "$HealthBody" | grep -o '"cronHealthy":[^,}]*' | cut -d':' -f2)
-            SINCE_LAST=$(echo "$HealthBody" | grep -o '"sinceLastRunSeconds":[^,}]*' | cut -d':' -f2)
+            CRON_TRIGGERED=$(echo "$HealthBody" | grep -o '"cronTriggered":[^,}]*' | cut -d':' -f2)
+            SINCE_COLLECT=$(echo "$HealthBody" | grep -o '"sinceLastCollectSeconds":[^,}]*' | cut -d':' -f2)
             HAS_LOCK=$(echo "$HealthBody" | grep -o '"hasLock":[^,}]*' | cut -d':' -f2)
             
-            echo "Cron Healthy: $CRON_HEALTHY"
-            echo "Since Last Run: ${SINCE_LAST}s"
+            echo "Cron Healthy (collection executed recently): $CRON_HEALTHY"
+            echo "Cron Triggered (cron fired recently): $CRON_TRIGGERED"
+            echo "Since Last Collection: ${SINCE_COLLECT}s"
             echo "Has Lock: $HAS_LOCK"
             
             if [ "$CRON_HEALTHY" = "true" ]; then
-              echo "✅ Cloudflare Cron is healthy (last run ${SINCE_LAST}s ago), skipping backup trigger"
+              echo "✅ Collection executed recently (${SINCE_COLLECT}s ago), skipping backup trigger"
               exit 0
             fi
             
@@ -46,8 +48,16 @@ jobs:
               exit 0
             fi
             
-            echo "⚠️ Cloudflare Cron appears unhealthy (last run ${SINCE_LAST}s ago), triggering backup"
-            TRIGGER_NEEDED=true
+            if [ "$CRON_TRIGGERED" = "true" ] && [ "$CRON_HEALTHY" = "false" ]; then
+              echo "⚠️ Cron is triggered but collection not executing (possible DB error), triggering backup"
+              TRIGGER_NEEDED=true
+            elif [ "$CRON_TRIGGERED" = "false" ]; then
+              echo "⚠️ Cloudflare Cron appears stopped (last trigger unknown), triggering backup"
+              TRIGGER_NEEDED=true
+            else
+              echo "⚠️ Cloudflare Cron unhealthy (last collection ${SINCE_COLLECT}s ago), triggering backup"
+              TRIGGER_NEEDED=true
+            fi
           fi
           
           if [ "$TRIGGER_NEEDED" = "true" ]; then
@@ -65,7 +75,7 @@ jobs:
             
             SKIPPED=$(echo "$ResponseBody" | grep -o '"skipped":[^,}]*' | cut -d':' -f2)
             if [ "$SKIPPED" = "true" ]; then
-              echo "✅ Worker decided to skip (Cron recovered or task running)"
+              echo "✅ Worker decided to skip (collection recovered or task running)"
               exit 0
             fi
             

@@ -624,9 +624,14 @@ async function collectWithApi(
   
   console.log(`[collectWithApi] Source config:`, { apiHost, imdbTypes: Object.keys(imdbTypes) });
   
-  // 获取本地分类
-  const categories = await db.select().from(types).where(eq(types.status, 1));
-  console.log(`[collectWithApi] Found ${categories.length} local categories`);
+  let categories: any[];
+  try {
+    categories = await db.select().from(types).where(eq(types.status, 1));
+    console.log(`[collectWithApi] Found ${categories.length} local categories`);
+  } catch (dbError) {
+    console.error('[collectWithApi] 读取分类失败:', dbError);
+    return { total: 0, success: 0, failed: 1 };
+  }
   
   // 获取或创建未知分类作为 fallback
   let unknownCategory = categories.find(cat => 
@@ -1224,7 +1229,7 @@ async function collectWithApi(
               
               return {
                 playUrl: cleanedPlayUrl,
-                playFrom: vodData.vod_play_from || vodPlayFrom || 'default'
+                playFrom: vodData.vod_play_from || 'default'
               };
             };
             

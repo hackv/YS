@@ -51,18 +51,24 @@ app.get('/api/diagnose/cron', async (c) => {
   try {
     const heartbeat = await c.env.CACHE.get('cron_heartbeat');
     const lastRun = await c.env.CACHE.get('cron_last_run');
+    const lastCollect = await c.env.CACHE.get('cron_last_collect');
     const lockValue = await c.env.CACHE.get('collect_batch_running');
     const abortValue = await c.env.CACHE.get('collect_batch_abort');
     
     const lastRunMs = lastRun ? parseInt(lastRun) : 0;
+    const lastCollectMs = lastCollect ? parseInt(lastCollect) : 0;
     const nowMs = Date.now();
     const sinceLastRun = lastRunMs > 0 ? Math.round((nowMs - lastRunMs) / 1000) : -1;
+    const sinceLastCollect = lastCollectMs > 0 ? Math.round((nowMs - lastCollectMs) / 1000) : -1;
     
     return c.json(response.success({
       cronHeartbeat: heartbeat,
       cronLastRun: lastRun ? new Date(parseInt(lastRun)).toISOString() : null,
+      cronLastCollect: lastCollect ? new Date(parseInt(lastCollect)).toISOString() : null,
       sinceLastRunSeconds: sinceLastRun,
-      cronHealthy: sinceLastRun >= 0 && sinceLastRun < 480,
+      sinceLastCollectSeconds: sinceLastCollect,
+      cronHealthy: sinceLastCollect >= 0 && sinceLastCollect < 480,
+      cronTriggered: sinceLastRun >= 0 && sinceLastRun < 480,
       currentTime: new Date().toISOString(),
       currentTimeBeijing: getBeijingTime(),
       hasLock: !!lockValue,
@@ -80,14 +86,14 @@ app.post('/api/diagnose/trigger-cron', async (c) => {
     const db = createDatabase(c.env.DB);
     const beijingTime = getBeijingTime();
     
-    const lastRunStr = await c.env.CACHE.get('cron_last_run');
-    const lastRunMs = lastRunStr ? parseInt(lastRunStr) : 0;
-    const sinceLastRun = lastRunMs > 0 ? (Date.now() - lastRunMs) / 1000 : -1;
+    const lastCollectStr = await c.env.CACHE.get('cron_last_collect');
+    const lastCollectMs = lastCollectStr ? parseInt(lastCollectStr) : 0;
+    const sinceLastCollect = lastCollectMs > 0 ? (Date.now() - lastCollectMs) / 1000 : -1;
     
-    if (sinceLastRun >= 0 && sinceLastRun < 480) {
+    if (sinceLastCollect >= 0 && sinceLastCollect < 480) {
       return c.json(response.success({
-        message: 'Cloudflare Cron 心跳正常，跳过执行',
-        sinceLastRunSeconds: Math.round(sinceLastRun),
+        message: '采集任务近期已执行，跳过',
+        sinceLastCollectSeconds: Math.round(sinceLastCollect),
         triggerTime: beijingTime,
         skipped: true,
       }));
@@ -125,10 +131,11 @@ app.post('/api/diagnose/trigger-cron', async (c) => {
     await executeBatchCollection(db, c.env.CACHE, abortCheck);
     
     await c.env.CACHE.delete('collect_batch_running');
+    await c.env.CACHE.put('cron_last_collect', String(Date.now()), { expirationTtl: 86400 });
     
     return c.json(response.success({
       message: '手动触发了采集任务（Cloudflare Cron 可能已停止）',
-      sinceLastRunSeconds: Math.round(sinceLastRun),
+      sinceLastCollectSeconds: Math.round(sinceLastCollect),
       triggerTime: beijingTime,
       skipped: false,
     }));
@@ -184,13 +191,11 @@ export default {
     console.log('Scheduled task running (UTC+8):', beijingTime);
     console.log('Cron expression:', event.cron);
     
-    // 记录 cron 心跳到 KV，用于诊断 cron 是否被触发
     await env.CACHE.put('cron_heartbeat', beijingTime, { expirationTtl: 86400 });
     await env.CACHE.put('cron_last_run', String(Date.now()), { expirationTtl: 86400 });
     
     switch (event.cron) {
       case '*/5 * * * *':
-        // 每 5 分钟执行一次分批采集任务（同步执行，避免 CPU 超时）
         console.log('[CRON] Starting batch collection...');
         await (async () => {
           const startTime = Date.now();
@@ -249,8 +254,9 @@ export default {
             console.log('[CRON] Starting executeBatchCollection...');
             await executeBatchCollection(db, env.CACHE, abortCheck);
             
-            console.log('[CRON] Removing lock...');
             await env.CACHE.delete(taskLockKey);
+            
+            await env.CACHE.put('cron_last_collect', String(Date.now()), { expirationTtl: 86400 });
             
             const duration = Date.now() - startTime;
             console.log(`[CRON] ✅ Task completed in ${duration}ms`);
@@ -259,7 +265,6 @@ export default {
             console.error(`[CRON] ❌ Task failed after ${duration}ms:`, error);
             console.error('[CRON] Error stack:', (error as Error).stack);
             
-            // 无论如何都清理锁，防止死锁
             await env.CACHE.delete('collect_batch_running');
             await env.CACHE.delete('collect_batch_abort');
           }
@@ -469,7 +474,13 @@ async function executeCollectionTasks(db: ReturnType<typeof createDatabase>, cro
 async function executeBatchCollection(db: ReturnType<typeof createDatabase>, cache: KVNamespace, abortCheck?: () => Promise<void>) {
   const { spiderSources, collectTaskLogs } = await import('./db');
   
-  const activeSources = await db.select().from(spiderSources).where(eq(spiderSources.status, 1));
+  let activeSources: any[];
+  try {
+    activeSources = await db.select().from(spiderSources).where(eq(spiderSources.status, 1));
+  } catch (dbError) {
+    console.error('[executeBatchCollection] 读取采集源失败:', dbError);
+    throw new Error('DB_READ_SOURCES_FAILED: ' + String(dbError));
+  }
   
   if (activeSources.length === 0) {
     return;
