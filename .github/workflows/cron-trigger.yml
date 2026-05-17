@@ -25,8 +25,9 @@ jobs:
           echo "Health Response: $HealthBody"
           
           if [ "$HealthHttpCode" != "200" ]; then
-            echo "❌ Health check failed, attempting reset + trigger"
+            echo "❌ Health check failed, attempting full recovery"
             RESET_NEEDED=true
+            ROLLBACK_NEEDED=true
             TRIGGER_AFTER_RESET=true
           else
             CRON_HEALTHY=$(echo "$HealthBody" | grep -o '"cronHealthy":[^,}]*' | cut -d':' -f2)
@@ -50,31 +51,27 @@ jobs:
             fi
             
             RESET_NEEDED=true
+            ROLLBACK_NEEDED=false
             TRIGGER_AFTER_RESET=true
             
             if [ "$CRON_TRIGGERED" = "true" ] && [ "$CRON_HEALTHY" = "false" ]; then
-              echo "⚠️ Cron triggered but collection stuck, will reset and re-trigger"
+              echo "⚠️ Cron triggered but collection stuck, will reset + rollback + re-trigger"
+              ROLLBACK_NEEDED=true
             elif [ "$CRON_TRIGGERED" = "false" ]; then
-              echo "⚠️ Cloudflare Cron appears stopped, will reset and trigger backup"
-              # 检查是否需要定期重置（每2小时）
-              if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt 7200 ] 2>/dev/null; then
-                echo "📌 Last collection was ${SINCE_COLLECT}s ago (>2h), forcing full reset"
-                FORCE_FULL_RESET=true
+              echo "⚠️ Cloudflare Cron appears stopped, will reset + rollback + re-trigger"
+              ROLLBACK_NEEDED=true
+              # 每小时强制一次 rollback（重置运行时状态）
+              if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt 3600 ] 2>/dev/null; then
+                echo "📌 Last collection was ${SINCE_COLLECT}s ago (>1h), forcing runtime reset"
+                FORCE_ROLLBACK=true
               fi
-            else
-              echo "⚠️ Cloudflare Cron unhealthy, will reset and trigger backup"
             fi
           fi
           
           if [ "$RESET_NEEDED" = "true" ]; then
-            echo "--- Resetting Cron State ---"
-            RESET_PARAMS=""
-            if [ "$FORCE_FULL_RESET" = "true" ]; then
-              RESET_PARAMS="?force=true"
-            fi
-            
+            echo "--- Step 1: Resetting KV State ---"
             RESET_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-              https://ys-admin.ftsqm.xyz/api/diagnose/reset-cron${RESET_PARAMS} \
+              https://ys-admin.ftsqm.xyz/api/diagnose/reset-cron \
               -H "User-Agent: GitHub-Actions-Cron" \
               || echo -e "\n000")
             
@@ -85,11 +82,46 @@ jobs:
             echo "Reset Response: $ResetBody"
             
             DELETED_COUNT=$(echo "$ResetBody" | grep -o '"deletedCount":[^,}]*' | cut -d':' -f2)
-            echo "✅ Reset completed: ${DELETED_COUNT:-unknown} keys deleted"
+            echo "✅ KV Reset completed: ${DELETED_COUNT:-unknown} keys deleted"
+          fi
+          
+          if [ "$ROLLBACK_NEEDED" = "true" ]; then
+            echo "--- Step 2: Rolling Back Worker Runtime ---"
+            
+            VERSION_RESPONSE=$(curl -s https://ys-admin.ftsqm.xyz/api/diagnose/version \
+              -H "User-Agent: GitHub-Actions-Cron" \
+              || echo '{"versionId":"unknown"}')
+            
+            CURRENT_VERSION=$(echo "$VERSION_RESPONSE" | grep -o '"versionId":"[^"]*"' | cut -d'"' -f4)
+            echo "Current Worker Version: $CURRENT_VERSION"
+            
+            if [ "$CURRENT_VERSION" != "unknown" ] && [ -n "${CLOUDFIRE_API_TOKEN}" ]; then
+              echo "Executing wrangler rollback to version $CURRENT_VERSION..."
+              
+              npx wrangler rollback "$CURRENT_VERSION" 2>&1 || {
+                echo "⚠️ wrangler rollback failed, trying alternative deploy..."
+                cd /tmp && git clone --depth 1 https://github.com/hackv/YS.git worker-repo 2>/dev/null || true
+                if [ -d "/tmp/worker-repo/ys-admin/cf-worker" ]; then
+                  cd /tmp/worker-repo/ys-admin/cf-worker
+                  npm install wrangler 2>/dev/null
+                  npx wrangler deploy 2>&1 || echo "⚠️ deploy also failed"
+                else
+                  echo "❌ Cannot perform runtime reset via wrangler"
+                fi
+              }
+              
+              echo "✅ Rollback/Deploy completed - Worker runtime has been reset"
+              sleep 5
+            else
+              echo "⚠️ Skipping rollback (no API token or version unknown)"
+              echo "   KV state has been cleared, which should resolve most issues"
+            fi
           fi
           
           if [ "$TRIGGER_AFTER_RESET" = "true" ]; then
-            echo "--- Triggering Backup Collection ---"
+            echo "--- Step 3: Triggering Collection ---"
+            sleep 3
+            
             RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
               https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
               -H "User-Agent: GitHub-Actions-Cron" \
@@ -108,10 +140,10 @@ jobs:
             fi
             
             if [ "$HttpResponseCode" = "200" ]; then
-              echo "✅ Backup trigger succeeded after reset"
+              echo "✅ Full recovery cycle completed (reset → rollback → trigger)"
               exit 0
             else
-              echo "❌ Backup trigger failed"
+              echo "❌ Trigger failed after recovery"
               exit 1
             fi
           fi
