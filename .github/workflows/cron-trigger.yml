@@ -65,9 +65,9 @@ jobs:
               NEED_ROLLBACK=true
             fi
             
-            # 强制重置：超过 30 分钟未采集（降低阈值，更快响应）
-            if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt 1800 ] 2>/dev/null; then
-              echo "📌 No collection for >30min (${SINCE_COLLECT}s), forcing rollback"
+            # 强制重置：超过 15 分钟未采集则强制重启 Isolate
+            if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt 900 ] 2>/dev/null; then
+              echo "📌 No collection for >15min (${SINCE_COLLECT}s), forcing rollback"
               NEED_ROLLBACK=true
             fi
           fi
