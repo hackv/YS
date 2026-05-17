@@ -496,7 +496,14 @@ async function executeBatchCollection(db: ReturnType<typeof createDatabase>, cac
     
     const KV_KEY_PREFIX = `collect_progress_${source.id}_`;
     
-    // 获取当前索引
+    const indexVersion = await cache.get(KV_KEY_PREFIX + 'index_version');
+    if (indexVersion !== 'v2') {
+      console.log(`[executeBatchCollection] Index version mismatch (expected v2, got ${indexVersion}), resetting index`);
+      await cache.delete(KV_KEY_PREFIX + 'current_index');
+      await cache.delete(KV_KEY_PREFIX + 'total_categories');
+      await cache.put(KV_KEY_PREFIX + 'index_version', 'v2', { expirationTtl: 86400 });
+    }
+    
     const currentIndexStr = await cache.get(KV_KEY_PREFIX + 'current_index');
     let currentIndex = currentIndexStr ? parseInt(currentIndexStr) : 0;
     

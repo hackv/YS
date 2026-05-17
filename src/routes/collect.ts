@@ -536,9 +536,9 @@ async function collectWithApi(
   
   // ========== 核心参数配置（Cloudflare Workers 优化策略）==========
   // Cloudflare Workers 子请求限制：50 个（硬性限制，无法通过延迟重置）
-  const MAX_SUBREQUESTS = 50;
-  const RESERVE_REQUESTS = 2; // 预留 2 个用于数据库操作
-  const AVAILABLE_REQUESTS = MAX_SUBREQUESTS - RESERVE_REQUESTS; // 实际可用：48 个
+  const MAX_SUBREQUESTS = 200;
+  const RESERVE_REQUESTS = 10;
+  const AVAILABLE_REQUESTS = MAX_SUBREQUESTS - RESERVE_REQUESTS;
   
   // 数据完整性硬性要求（必须满足）
   const MIN_DETAIL_PER_CATEGORY = 20; // 每个分类最少采集 20 个详情（硬性要求，不可妥协）
@@ -712,14 +712,11 @@ async function collectWithApi(
       console.log(`[collectWithApi] Target category not found for categoryId: ${categoryId}`);
     }
   } else {
-    // 使用从首页获取到的源分类，结合本地分类建立映射
     if (sourceCategories.length > 0) {
-      let processedCount = 0;
+      const subCategoryMap = new Map<string, { sourceTypeId: string, sourceTypeName: string, parentTypeId: string }[]>();
+      
       for (const sourceCat of sourceCategories) {
         const sourceTypeId = String(sourceCat.type_id);
-        console.log(`[collectWithApi] Processing source category (${processedCount + 1}/${sourceCategories.length}): type_id=${sourceTypeId}, type_name=${sourceCat.type_name}`);
-        
-        // 尝试找到匹配的本地分类
         let targetCategory = categories.find(cat => 
           String(imdbTypes[cat.enName]) === sourceTypeId || 
           String(imdbTypes[cat.name]) === sourceTypeId ||
@@ -727,7 +724,6 @@ async function collectWithApi(
           String(cat.id) === sourceTypeId
         );
         
-        // 如果精确匹配失败，尝试模糊匹配
         if (!targetCategory) {
           targetCategory = categories.find(cat => 
             sourceCat.type_name.includes(cat.name) || 
@@ -737,17 +733,59 @@ async function collectWithApi(
         
         if (targetCategory) {
           typeMapping.set(sourceTypeId, targetCategory.id);
-          console.log(`[collectWithApi] ✓ Mapping found: ${sourceCat.type_name}(${sourceTypeId}) -> ${targetCategory.name}`);
-          processedCount++;
+          console.log(`[collectWithApi] ✓ Mapping: ${sourceCat.type_name}(${sourceTypeId}) -> ${targetCategory.name}`);
         } else {
-          // 如果找不到对应本地分类，使用未知分类作为 fallback
           typeMapping.set(sourceTypeId, fallbackCategory.id);
-          console.log(`[collectWithApi] ⚠️ No mapping found, using fallback: ${sourceCat.type_name}(${sourceTypeId}) -> ${fallbackCategory.name}`);
-          processedCount++;
+          console.log(`[collectWithApi] ⚠️ Fallback: ${sourceCat.type_name}(${sourceTypeId}) -> ${fallbackCategory.name}`);
         }
       }
+      
+      for (const sourceCat of sourceCategories) {
+        const sourceTypeId = String(sourceCat.type_id);
+        try {
+          const subCatUrl = `${apiHost}?ac=list&t=${sourceTypeId}&pg=1`;
+          const subCatResp = await fetch(subCatUrl, {
+            method: 'GET',
+            headers: {
+              'Accept': 'application/json',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            signal: AbortSignal.timeout(DEFAULT_REQ_TIMEOUT)
+          });
+          
+          if (subCatResp.ok) {
+            const subCatData = await subCatResp.json();
+            if (subCatData.class && Array.isArray(subCatData.class)) {
+              const childCategories = subCatData.class
+                .filter((c: any) => Number(c.type_pid) === Number(sourceTypeId));
+              
+              if (childCategories.length > 0) {
+                const parentTargetId = typeMapping.get(sourceTypeId) || fallbackCategory.id;
+                const subCats: { sourceTypeId: string, sourceTypeName: string, parentTypeId: string }[] = [];
+                
+                for (const child of childCategories) {
+                  const childTypeId = String(child.type_id);
+                  typeMapping.set(childTypeId, parentTargetId);
+                  subCats.push({ sourceTypeId: childTypeId, sourceTypeName: child.type_name, parentTypeId: sourceTypeId });
+                }
+                
+                subCategoryMap.set(sourceTypeId, subCats);
+                console.log(`[collectWithApi] 📂 ${sourceCat.type_name}(${sourceTypeId}): expanded ${childCategories.length} subcategories`);
+              }
+            }
+          }
+        } catch (e) {
+          console.error(`[collectWithApi] Failed to fetch subcategories for ${sourceTypeId}:`, e);
+        }
+      }
+      
+      if (subCategoryMap.size > 0) {
+        for (const [parentTypeId] of subCategoryMap) {
+          typeMapping.delete(parentTypeId);
+        }
+        console.log(`[collectWithApi] 🔄 Removed ${subCategoryMap.size} parent categories, using ${typeMapping.size} subcategories instead`);
+      }
     } else {
-      // 如果没有获取到源分类，继续使用旧逻辑
       console.log(`[collectWithApi] No source categories from API, using local categories`);
       for (const cat of categories) {
         const sourceTypeId = String(imdbTypes[cat.enName] || imdbTypes[cat.name] || cat.id);
@@ -859,8 +897,6 @@ async function collectWithApi(
     let pagesFetched = 0;
     let itemsNeeded = minDetailPerCategory;
     
-    let subCategories: number[] = [];
-    
     while (categoryItems.length < itemsNeeded && pagesFetched < PAGES_PER_CATEGORY) {
       pagesFetched++;
       
@@ -899,48 +935,9 @@ async function collectWithApi(
         
         const apiData = await resp.json();
         
-        console.log(`[collectWithApi] API response keys: ${Object.keys(apiData).join(', ')}`);
-        
         if (!apiData.list || !Array.isArray(apiData.list) || apiData.list.length === 0) {
-          if (apiData.class && Array.isArray(apiData.class) && subCategories.length === 0) {
-            subCategories = apiData.class
-              .filter((c: any) => Number(c.type_pid) === Number(sourceTypeId))
-              .map((c: any) => c.type_id);
-            
-            console.log(`[collectWithApi] Found ${subCategories.length} subcategories for ${sourceTypeId}: ${subCategories.join(', ')}`);
-          }
-          
-          if (subCategories.length > 0) {
-            const firstSubCat = subCategories.shift();
-            console.log(`[collectWithApi] Switching to subcategory ${firstSubCat} since main category is empty`);
-            
-            const subCatUrl = `${apiHost}?ac=list&t=${firstSubCat}&pg=1`;
-            const subCatResp = await fetch(subCatUrl, {
-              method: 'GET',
-              headers: {
-                'Accept': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-              },
-              signal: AbortSignal.timeout(DEFAULT_REQ_TIMEOUT)
-            });
-            
-            if (subCatResp.ok) {
-              const subCatData = await subCatResp.json();
-              console.log(`[collectWithApi] Subcategory ${firstSubCat} response keys: ${Object.keys(subCatData).join(', ')}`);
-              
-              if (subCatData.list && Array.isArray(subCatData.list) && subCatData.list.length > 0) {
-                for (const item of subCatData.list) {
-                  const itemId = item.vod_id || item.id || item.vodId;
-                  if (itemId && categoryItems.length < itemsNeeded) {
-                    categoryItems.push({ ...item, targetTypeId, vod_id: itemId });
-                  }
-                }
-                console.log(`[collectWithApi] Got ${subCatData.list.length} items from subcategory ${firstSubCat}`);
-              }
-            }
-          }
-          
-          continue;
+          console.log(`[collectWithApi] No items in category ${sourceTypeId} page ${pagesFetched}, moving to next category`);
+          break;
         }
         
         for (const item of apiData.list) {
