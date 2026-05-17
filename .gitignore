@@ -1,15 +1,11 @@
+# 只同步 GitHub Actions workflow
+/*
+!/.github/
+!/.gitignore
+
+# 始终忽略
 node_modules/
 .wrangler/
 .dev.vars
 *.bak
 .trae.bak/
-hash.txt
-fix-password.js
-generate-hash.js
-test-password.js
-deploy.ps1
-DEPLOY.md
-docs/
-migrations/
-update-admin-password.sql
-update-pwd.sql
