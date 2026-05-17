@@ -1,35 +1,79 @@
-name: Trigger Collection - Manual & Schedule
+name: Trigger Collection - Backup Cron
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # 每 5 分钟自动运行（UTC 时间）
-  workflow_dispatch:        # 允许手动触发
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   trigger:
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger Collection (POST request)
+      - name: Check Cron Health & Trigger if Needed
         run: |
-          echo "Triggering ys-admin Worker at $(date -u)"
+          echo "=== Backup Cron Check at $(date -u) ==="
           
-          # 使用 curl 发送 POST 请求
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
+          HEALTH_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            https://ys-admin.ftsqm.xyz/api/diagnose/cron \
             -H "User-Agent: GitHub-Actions-Cron" \
             || echo -e "\n000")
           
-          HttpResponseCode=$(echo "$RESPONSE" | tail -n1)
-          ResponseBody=$(echo "$RESPONSE" | sed '$d')
+          HealthHttpCode=$(echo "$HEALTH_RESPONSE" | tail -n1)
+          HealthBody=$(echo "$HEALTH_RESPONSE" | sed '$d')
           
-          echo "HTTP Status: $HttpResponseCode"
-          echo "Response: $ResponseBody"
+          echo "Health Check HTTP: $HealthHttpCode"
+          echo "Health Response: $HealthBody"
           
-          # 检查响应是否成功
-          if [ "$HttpResponseCode" = "200" ] && echo "$ResponseBody" | grep -q "\"code\":1"; then
-            echo "✅ Trigger succeeded"
-            exit 0
+          if [ "$HealthHttpCode" != "200" ]; then
+            echo "❌ Health check failed, attempting trigger anyway"
+            TRIGGER_NEEDED=true
           else
-            echo "❌ Trigger failed or returned error"
-            exit 1
+            CRON_HEALTHY=$(echo "$HealthBody" | grep -o '"cronHealthy":[^,}]*' | cut -d':' -f2)
+            SINCE_LAST=$(echo "$HealthBody" | grep -o '"sinceLastRunSeconds":[^,}]*' | cut -d':' -f2)
+            HAS_LOCK=$(echo "$HealthBody" | grep -o '"hasLock":[^,}]*' | cut -d':' -f2)
+            
+            echo "Cron Healthy: $CRON_HEALTHY"
+            echo "Since Last Run: ${SINCE_LAST}s"
+            echo "Has Lock: $HAS_LOCK"
+            
+            if [ "$CRON_HEALTHY" = "true" ]; then
+              echo "✅ Cloudflare Cron is healthy (last run ${SINCE_LAST}s ago), skipping backup trigger"
+              exit 0
+            fi
+            
+            if [ "$HAS_LOCK" = "true" ]; then
+              echo "⏳ Collection task is running, skipping backup trigger"
+              exit 0
+            fi
+            
+            echo "⚠️ Cloudflare Cron appears unhealthy (last run ${SINCE_LAST}s ago), triggering backup"
+            TRIGGER_NEEDED=true
+          fi
+          
+          if [ "$TRIGGER_NEEDED" = "true" ]; then
+            echo "--- Triggering backup collection ---"
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
+              -H "User-Agent: GitHub-Actions-Cron" \
+              || echo -e "\n000")
+            
+            HttpResponseCode=$(echo "$RESPONSE" | tail -n1)
+            ResponseBody=$(echo "$RESPONSE" | sed '$d')
+            
+            echo "Trigger HTTP: $HttpResponseCode"
+            echo "Trigger Response: $ResponseBody"
+            
+            SKIPPED=$(echo "$ResponseBody" | grep -o '"skipped":[^,}]*' | cut -d':' -f2)
+            if [ "$SKIPPED" = "true" ]; then
+              echo "✅ Worker decided to skip (Cron recovered or task running)"
+              exit 0
+            fi
+            
+            if [ "$HttpResponseCode" = "200" ]; then
+              echo "✅ Backup trigger succeeded"
+              exit 0
+            else
+              echo "❌ Backup trigger failed"
+              exit 1
+            fi
           fi

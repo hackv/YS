@@ -1,0 +1,31 @@
+name = "ys-admin-worker"
+main = "src/index.ts"
+compatibility_date = "2024-04-23"
+compatibility_flags = [ "nodejs_compat" ]
+
+[vars]
+ENVIRONMENT = "production"
+JWT_SECRET = "ys-admin-jwt-secret"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ys-admin-db"
+database_id = "2e2378e6-62bc-4868-9f67-98b303a18f29"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "9ba0fd5bd11942588a022927d459056e"
+
+[[r2_buckets]]
+binding = "BACKUP_BUCKET"
+bucket_name = "ys-admin-backups"
+
+[triggers]
+crons = [ "*/5 * * * *" ]
+
+[[unsafe.vars]]
+name = "subrequest_limit"
+value = "200"
+
+[observability]
+enabled = true
