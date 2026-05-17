@@ -740,45 +740,23 @@ async function collectWithApi(
         }
       }
       
+      const allApiCategories = sourceCategories;
       for (const sourceCat of sourceCategories) {
         const sourceTypeId = String(sourceCat.type_id);
-        try {
-          const subCatUrl = `${apiHost}?ac=list&t=${sourceTypeId}&pg=1`;
-          const subCatResp = await fetch(subCatUrl, {
-            method: 'GET',
-            headers: {
-              'Accept': 'application/json',
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            },
-            signal: AbortSignal.timeout(DEFAULT_REQ_TIMEOUT)
-          });
+        const childCategories = allApiCategories.filter((c: any) => Number(c.type_pid) === Number(sourceTypeId));
+        
+        if (childCategories.length > 0) {
+          const parentTargetId = typeMapping.get(sourceTypeId) || fallbackCategory.id;
           
-          if (subCatResp.ok) {
-            const subCatData = await subCatResp.json();
-            
-            if (subCatData.class && Array.isArray(subCatData.class)) {
-              const childCategories = subCatData.class
-                .filter((c: any) => Number(c.type_pid) === Number(sourceTypeId));
-              
-              if (childCategories.length > 0) {
-                const parentTargetId = typeMapping.get(sourceTypeId) || fallbackCategory.id;
-                
-                for (const child of childCategories) {
-                  const childTypeId = String(child.type_id);
-                  typeMapping.set(childTypeId, parentTargetId);
-                }
-                
-                subCategoryMap.set(sourceTypeId, childCategories.length);
-                console.log(`[collectWithApi] 📂 ${sourceCat.type_name}(${sourceTypeId}): expanded ${childCategories.length} subcategories`);
-              } else {
-                console.log(`[collectWithApi] 📄 ${sourceCat.type_name}(${sourceTypeId}): no subcategories, will collect directly`);
-              }
-            } else {
-              console.log(`[collectWithApi] 📄 ${sourceCat.type_name}(${sourceTypeId}): no class field, will collect directly`);
-            }
+          for (const child of childCategories) {
+            const childTypeId = String(child.type_id);
+            typeMapping.set(childTypeId, parentTargetId);
           }
-        } catch (e) {
-          console.error(`[collectWithApi] Failed to fetch subcategories for ${sourceTypeId}:`, e);
+          
+          subCategoryMap.set(sourceTypeId, childCategories.length);
+          console.log(`[collectWithApi] 📂 ${sourceCat.type_name}(${sourceTypeId}): expanded ${childCategories.length} subcategories from home page data`);
+        } else {
+          console.log(`[collectWithApi] 📄 ${sourceCat.type_name}(${sourceTypeId}): no subcategories, will collect directly`);
         }
       }
       
