@@ -25,8 +25,9 @@ jobs:
           echo "Health Response: $HealthBody"
           
           if [ "$HealthHttpCode" != "200" ]; then
-            echo "❌ Health check failed, attempting trigger anyway"
-            TRIGGER_NEEDED=true
+            echo "❌ Health check failed, attempting reset + trigger"
+            RESET_NEEDED=true
+            TRIGGER_AFTER_RESET=true
           else
             CRON_HEALTHY=$(echo "$HealthBody" | grep -o '"cronHealthy":[^,}]*' | cut -d':' -f2)
             CRON_TRIGGERED=$(echo "$HealthBody" | grep -o '"cronTriggered":[^,}]*' | cut -d':' -f2)
@@ -48,20 +49,47 @@ jobs:
               exit 0
             fi
             
+            RESET_NEEDED=true
+            TRIGGER_AFTER_RESET=true
+            
             if [ "$CRON_TRIGGERED" = "true" ] && [ "$CRON_HEALTHY" = "false" ]; then
-              echo "⚠️ Cron is triggered but collection not executing (possible DB error), triggering backup"
-              TRIGGER_NEEDED=true
+              echo "⚠️ Cron triggered but collection stuck, will reset and re-trigger"
             elif [ "$CRON_TRIGGERED" = "false" ]; then
-              echo "⚠️ Cloudflare Cron appears stopped (last trigger unknown), triggering backup"
-              TRIGGER_NEEDED=true
+              echo "⚠️ Cloudflare Cron appears stopped, will reset and trigger backup"
+              # 检查是否需要定期重置（每2小时）
+              if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt 7200 ] 2>/dev/null; then
+                echo "📌 Last collection was ${SINCE_COLLECT}s ago (>2h), forcing full reset"
+                FORCE_FULL_RESET=true
+              fi
             else
-              echo "⚠️ Cloudflare Cron unhealthy (last collection ${SINCE_COLLECT}s ago), triggering backup"
-              TRIGGER_NEEDED=true
+              echo "⚠️ Cloudflare Cron unhealthy, will reset and trigger backup"
             fi
           fi
           
-          if [ "$TRIGGER_NEEDED" = "true" ]; then
-            echo "--- Triggering backup collection ---"
+          if [ "$RESET_NEEDED" = "true" ]; then
+            echo "--- Resetting Cron State ---"
+            RESET_PARAMS=""
+            if [ "$FORCE_FULL_RESET" = "true" ]; then
+              RESET_PARAMS="?force=true"
+            fi
+            
+            RESET_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              https://ys-admin.ftsqm.xyz/api/diagnose/reset-cron${RESET_PARAMS} \
+              -H "User-Agent: GitHub-Actions-Cron" \
+              || echo -e "\n000")
+            
+            ResetHttpCode=$(echo "$RESET_RESPONSE" | tail -n1)
+            ResetBody=$(echo "$RESET_RESPONSE" | sed '$d')
+            
+            echo "Reset HTTP: $ResetHttpCode"
+            echo "Reset Response: $ResetBody"
+            
+            DELETED_COUNT=$(echo "$ResetBody" | grep -o '"deletedCount":[^,}]*' | cut -d':' -f2)
+            echo "✅ Reset completed: ${DELETED_COUNT:-unknown} keys deleted"
+          fi
+          
+          if [ "$TRIGGER_AFTER_RESET" = "true" ]; then
+            echo "--- Triggering Backup Collection ---"
             RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
               https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
               -H "User-Agent: GitHub-Actions-Cron" \
@@ -80,7 +108,7 @@ jobs:
             fi
             
             if [ "$HttpResponseCode" = "200" ]; then
-              echo "✅ Backup trigger succeeded"
+              echo "✅ Backup trigger succeeded after reset"
               exit 0
             else
               echo "❌ Backup trigger failed"
