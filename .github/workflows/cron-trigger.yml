@@ -5,6 +5,7 @@ on:
     - cron: '* * * * *'
   workflow_dispatch:
 
+# 添加失败通知
 jobs:
   trigger:
     runs-on: ubuntu-latest
@@ -38,8 +39,10 @@ jobs:
             CRON_TRIGGERED=$(echo "$HealthBody" | grep -o '"cronTriggered":[^,}]*' | cut -d':' -f2)
             SINCE_COLLECT=$(echo "$HealthBody" | grep -o '"sinceLastCollectSeconds":[^,}]*' | cut -d':' -f2)
             HAS_LOCK=$(echo "$HealthBody" | grep -o '"hasLock":[^,}]*' | cut -d':' -f2)
+            HOMEPAGE_MODE=$(echo "$HealthBody" | grep -o '"homepageMode":[^,}]*' | cut -d':' -f2)
+            HEALTHY_THRESHOLD=$(echo "$HealthBody" | grep -o '"collectHealthyThreshold":[^,}]*' | cut -d':' -f2)
             
-            echo "cronHealthy=$CRON_HEALTHY | cronTriggered=$CRON_TRIGGERED | sinceLastCollect=${SINCE_COLLECT}s | hasLock=$HAS_LOCK"
+            echo "cronHealthy=$CRON_HEALTHY | cronTriggered=$CRON_TRIGGERED | sinceLastCollect=${SINCE_COLLECT}s | hasLock=$HAS_LOCK | homepageMode=$HOMEPAGE_MODE | threshold=${HEALTHY_THRESHOLD}s"
             
             # 场景1：一切正常 → 跳过
             if [ "$CRON_HEALTHY" = "true" ]; then
@@ -65,9 +68,13 @@ jobs:
               NEED_ROLLBACK=true
             fi
             
-            # 强制重置：超过 15 分钟未采集则强制重启 Isolate
-            if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt 900 ] 2>/dev/null; then
-              echo "📌 No collection for >15min (${SINCE_COLLECT}s), forcing rollback"
+            # 强制重置：超过健康阈值 1.5 倍时间未采集则强制重启 Isolate
+            FORCE_THRESHOLD=$((${HEALTHY_THRESHOLD:-300} * 3 / 2))
+            if [ "$HOMEPAGE_MODE" = "true" ]; then
+              FORCE_THRESHOLD=$((${HEALTHY_THRESHOLD:-2100} + 600))
+            fi
+            if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt "$FORCE_THRESHOLD" ] 2>/dev/null; then
+              echo "📌 No collection for >${FORCE_THRESHOLD}s (${SINCE_COLLECT}s), forcing rollback"
               NEED_ROLLBACK=true
             fi
           fi
@@ -158,3 +165,16 @@ jobs:
               exit 1
             fi
           fi
+      
+      # 新增: 失败时发送通知
+      - name: Notify on Failure
+        if: failure()
+        run: |
+          echo "❌ GitHub Actions Cron 执行失败!"
+          echo "请检查:"
+          echo "1. Worker 是否正常运行: https://ys-admin.ftsqm.xyz/"
+          echo "2. GitHub Actions 日志: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "3. 手动修复: python quick_fix_collection.py"
+          
+          # 如果有配置 Discord/Slack webhook,可以在这里发送通知
+          # curl -X POST $WEBHOOK_URL -H "Content-Type: application/json" -d '{"text": "采集任务恢复失败!"}'
