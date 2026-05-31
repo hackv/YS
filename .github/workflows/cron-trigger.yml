@@ -5,7 +5,6 @@ on:
     - cron: '* * * * *'
   workflow_dispatch:
 
-# 添加失败通知
 jobs:
   trigger:
     runs-on: ubuntu-latest
@@ -18,6 +17,7 @@ jobs:
           HEALTH_RESPONSE=$(curl -s -w "\n%{http_code}" \
             https://ys-admin.ftsqm.xyz/api/diagnose/cron \
             -H "User-Agent: GitHub-Actions-Cron" \
+            --max-time 15 \
             || echo -e "\n000")
           
           HealthHttpCode=$(echo "$HEALTH_RESPONSE" | tail -n1)
@@ -26,13 +26,12 @@ jobs:
           echo "Health HTTP: $HealthHttpCode"
           echo "Health Response: $HealthBody"
           
-          # 初始化状态变量
-          NEED_ROLLBACK=false
+          NEED_REDEPLOY=false
           NEED_TRIGGER=false
           
           if [ "$HealthHttpCode" != "200" ]; then
             echo "❌ Health check failed (HTTP $HealthHttpCode)"
-            NEED_ROLLBACK=true
+            NEED_REDEPLOY=true
             NEED_TRIGGER=true
           else
             CRON_HEALTHY=$(echo "$HealthBody" | grep -o '"cronHealthy":[^,}]*' | cut -d':' -f2)
@@ -46,7 +45,7 @@ jobs:
             
             # 场景1：一切正常 → 跳过
             if [ "$CRON_HEALTHY" = "true" ]; then
-              echo "✅ Collection executed recently (${SINCE_COLLECT}s ago), skipping"
+              echo "✅ Collection healthy (${SINCE_COLLECT}s ago), skipping"
               exit 0
             fi
             
@@ -59,79 +58,73 @@ jobs:
             # 场景3：需要恢复
             NEED_TRIGGER=true
             
-            # 判断是否需要 rollback（重启 Worker Isolate）
+            # 判断是否需要 redeploy（重启 Worker Isolate）
             if [ "$CRON_TRIGGERED" = "false" ]; then
-              echo "⚠️ Cloudflare Cron stopped, need rollback to restart Isolate"
-              NEED_ROLLBACK=true
+              echo "⚠️ Cloudflare Cron stopped, need redeploy to restart Isolate"
+              NEED_REDEPLOY=true
             elif [ "$CRON_TRIGGERED" = "true" ] && [ "$CRON_HEALTHY" = "false" ]; then
-              echo "⚠️ Cron triggered but collection stuck, rollback needed"
-              NEED_ROLLBACK=true
+              echo "⚠️ Cron triggered but collection stuck, redeploy needed"
+              NEED_REDEPLOY=true
             fi
             
-            # 强制重置：超过健康阈值 1.5 倍时间未采集则强制重启 Isolate
+            # 强制重置：超过健康阈值时间未采集则强制重启 Isolate
             FORCE_THRESHOLD=$((${HEALTHY_THRESHOLD:-300} * 3 / 2))
             if [ "$HOMEPAGE_MODE" = "true" ]; then
               FORCE_THRESHOLD=$((${HEALTHY_THRESHOLD:-2100} + 600))
             fi
             if [ -n "$SINCE_COLLECT" ] && [ "$SINCE_COLLECT" -gt "$FORCE_THRESHOLD" ] 2>/dev/null; then
-              echo "📌 No collection for >${FORCE_THRESHOLD}s (${SINCE_COLLECT}s), forcing rollback"
-              NEED_ROLLBACK=true
+              echo "📌 No collection for >${FORCE_THRESHOLD}s (${SINCE_COLLECT}s), forcing redeploy"
+              NEED_REDEPLOY=true
             fi
           fi
           
-          # Step 1: Wrangler Rollback（真正重启 Worker Isolate）
-          if [ "$NEED_ROLLBACK" = "true" ]; then
+          # Step 1: 通过 Worker API 重新部署（重启 Worker Isolate）
+          if [ "$NEED_REDEPLOY" = "true" ]; then
             echo ""
-            echo "=== Step 1: Wrangler Rollback (Restart Worker Isolate) ==="
+            echo "=== Step 1: Auto-Redeploy via Worker API ==="
             
-            # 安装 wrangler
-            npm install -g wrangler@latest > /dev/null 2>&1 || true
+            REDEPLOY_SUCCESS=false
             
-            # 获取最新版本 ID
-            VERSION_INFO=$(curl -s https://ys-admin.ftsqm.xyz/api/diagnose/version \
-              -H "User-Agent: GitHub-Actions-Cron" || echo '{}')
+            # 尝试调用 Worker 的 auto-redeploy 接口（Worker 自己有 CF API Token）
+            echo "Calling /api/diagnose/auto-redeploy..."
+            REDEPLOY_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              https://ys-admin.ftsqm.xyz/api/diagnose/auto-redeploy \
+              -H "User-Agent: GitHub-Actions-Cron" \
+              -H "Content-Type: application/json" \
+              --max-time 30 \
+              || echo -e "\n000")
             
-            VERSION_ID=$(echo "$VERSION_INFO" | grep -o '"versionId":"[^"]*"' | cut -d'"' -f4)
+            RedeployHttpCode=$(echo "$REDEPLOY_RESPONSE" | tail -n1)
+            RedeployBody=$(echo "$REDEPLOY_RESPONSE" | sed '$d')
             
-            echo "Target Version ID: ${VERSION_ID:-unknown}"
+            echo "Redeploy HTTP: $RedeployHttpCode"
+            echo "Redeploy Response: $RedeployBody"
             
-            if [ -n "$VERSION_ID" ] && [ "$VERSION_ID" != "unknown" ] && [ "$VERSION_ID" != "" ]; then
-              echo "Executing: wrangler rollback $VERSION_ID --yes"
-              
-              ROLLBACK_OUTPUT=$(npx wrangler rollback "$VERSION_ID" --yes 2>&1) || {
-                ROLLBACK_ERROR=$?
-                echo "Rollback output: $ROLLBACK_OUTPUT"
-                echo "⚠️ Rollback command returned error code $ROLLBACK_ERROR"
-                echo "Fallback: using API redeploy instead..."
-                
-                # Fallback: 如果 rollback 失败，使用 API redeploy
-                curl -s -X POST https://ys-admin.ftsqm.xyz/api/diagnose/redeploy \
-                  -H "User-Agent: GitHub-Actions-Cron" \
-                  -H "Content-Type: application/json" > /dev/null || true
-                
-                sleep 5
-              }
-              
-              if [ $? -eq 0 ] && [ -z "$ROLLBACK_ERROR" ]; then
-                echo "✅ Rollback success! New Isolate will be created."
-                echo "Output: $ROLLBACK_OUTPUT"
-              else
-                echo "✅ Fallback redeploy completed (KV cleared)"
-              fi
+            # 检查 redeploy 是否成功
+            REDEPLOY_SUCCESS_VAL=$(echo "$RedeployBody" | grep -o '"success":[^,}]*' | head -1 | cut -d':' -f2)
+            COOLDOWN_ACTIVE=$(echo "$RedeployBody" | grep -o '"cooldown":[^,}]*' | cut -d':' -f2)
+            
+            if [ "$RedeployHttpCode" = "200" ] && [ "$REDEPLOY_SUCCESS_VAL" = "true" ]; then
+              echo "✅ Auto-redeploy succeeded! New Isolate will be created."
+              REDEPLOY_SUCCESS=true
+            elif [ "$COOLDOWN_ACTIVE" = "true" ]; then
+              echo "ℹ️ Auto-redeploy cooldown active, Isolate restart already in progress"
+              REDEPLOY_SUCCESS=true
             else
-              echo "⚠️ Could not get version ID, using fallback redeploy..."
+              echo "⚠️ Auto-redeploy failed, trying fallback reset..."
               
-              # Fallback: 使用 API redeploy 清理 KV
+              # Fallback: 重置状态（不重启 isolate，但清理锁和状态）
               curl -s -X POST https://ys-admin.ftsqm.xyz/api/diagnose/redeploy \
                 -H "User-Agent: GitHub-Actions-Cron" \
-                -H "Content-Type: application/json" > /dev/null || true
+                -H "Content-Type: application/json" \
+                --max-time 15 > /dev/null 2>&1 || true
               
-              echo "✅ Fallback redeploy completed (KV cleared)"
+              echo "✅ Fallback state reset completed"
             fi
             
             # 等待新 Isolate 生效
             echo "Waiting for new Isolate to initialize..."
-            sleep 5
+            sleep 8
           fi
           
           # Step 2: 触发采集任务
@@ -142,6 +135,7 @@ jobs:
             TRIGGER_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
               https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
               -H "User-Agent: GitHub-Actions-Cron" \
+              --max-time 30 \
               || echo -e "\n000")
             
             TriggerHttpCode=$(echo "$TRIGGER_RESPONSE" | tail -n1)
@@ -161,12 +155,26 @@ jobs:
               echo "✅ Recovery cycle completed successfully"
               exit 0
             else
-              echo "❌ Trigger failed after recovery (HTTP $TriggerHttpCode)"
-              exit 1
+              echo "❌ Trigger failed (HTTP $TriggerHttpCode)"
+              # 重试一次
+              echo "Retrying in 10s..."
+              sleep 10
+              RETRY_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+                https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
+                -H "User-Agent: GitHub-Actions-Cron" \
+                --max-time 30 \
+                || echo -e "\n000")
+              RetryHttpCode=$(echo "$RETRY_RESPONSE" | tail -n1)
+              if [ "$RetryHttpCode" = "200" ]; then
+                echo "✅ Retry succeeded"
+                exit 0
+              else
+                echo "❌ Retry also failed"
+                exit 1
+              fi
             fi
           fi
-      
-      # 新增: 失败时发送通知
+
       - name: Notify on Failure
         if: failure()
         run: |
@@ -174,7 +182,3 @@ jobs:
           echo "请检查:"
           echo "1. Worker 是否正常运行: https://ys-admin.ftsqm.xyz/"
           echo "2. GitHub Actions 日志: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "3. 手动修复: python quick_fix_collection.py"
-          
-          # 如果有配置 Discord/Slack webhook,可以在这里发送通知
-          # curl -X POST $WEBHOOK_URL -H "Content-Type: application/json" -d '{"text": "采集任务恢复失败!"}'
