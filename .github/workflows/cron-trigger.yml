@@ -17,6 +17,7 @@ jobs:
           HEALTH_RESPONSE=$(curl -s -w "\n%{http_code}" \
             https://ys-admin.ftsqm.xyz/api/diagnose/cron \
             -H "User-Agent: GitHub-Actions-Cron" \
+            -H "X-API-Key: ${{ secrets.CRON_API_KEY }}" \
             --max-time 15 \
             || echo -e "\n000")
           
@@ -91,6 +92,7 @@ jobs:
               https://ys-admin.ftsqm.xyz/api/diagnose/auto-redeploy \
               -H "User-Agent: GitHub-Actions-Cron" \
               -H "Content-Type: application/json" \
+              -H "X-API-Key: ${{ secrets.CRON_API_KEY }}" \
               --max-time 30 \
               || echo -e "\n000")
             
@@ -117,6 +119,7 @@ jobs:
               curl -s -X POST https://ys-admin.ftsqm.xyz/api/diagnose/redeploy \
                 -H "User-Agent: GitHub-Actions-Cron" \
                 -H "Content-Type: application/json" \
+                -H "X-API-Key: ${{ secrets.CRON_API_KEY }}" \
                 --max-time 15 > /dev/null 2>&1 || true
               
               echo "✅ Fallback state reset completed"
@@ -135,6 +138,7 @@ jobs:
             TRIGGER_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
               https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
               -H "User-Agent: GitHub-Actions-Cron" \
+              -H "X-API-Key: ${{ secrets.CRON_API_KEY }}" \
               --max-time 30 \
               || echo -e "\n000")
             
@@ -162,6 +166,7 @@ jobs:
               RETRY_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
                 https://ys-admin.ftsqm.xyz/api/diagnose/trigger-cron \
                 -H "User-Agent: GitHub-Actions-Cron" \
+                -H "X-API-Key: ${{ secrets.CRON_API_KEY }}" \
                 --max-time 30 \
                 || echo -e "\n000")
               RetryHttpCode=$(echo "$RETRY_RESPONSE" | tail -n1)
